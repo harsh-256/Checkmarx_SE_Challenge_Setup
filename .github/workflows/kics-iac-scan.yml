@@ -1,0 +1,44 @@
+name: KICS - IaC Security Scan
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  kics-scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run KICS scan
+        uses: checkmarx/kics-github-action@v2.1.20
+        with:
+          path: '.'
+          output_path: kics-results/
+          output_formats: 'json,sarif'
+          ignore_on_exit: results
+          enable_annotations: 'true'
+
+      - name: Display KICS results summary
+        if: always()
+        run: |
+          cat kics-results/results.json || echo "No results file produced"
+
+      - name: Upload SARIF to GitHub code scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: kics-results/results.sarif
+
+      - name: Upload KICS results as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kics-results-${{ github.run_id }}
+          path: kics-results/
