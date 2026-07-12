@@ -1,0 +1,162 @@
+name: AppSec Scan - Combined Summary
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # ---------- KICS: Infrastructure as Code scanning ----------
+  kics:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run KICS scan
+        uses: checkmarx/kics-github-action@v2.1.20
+        with:
+          path: '.'
+          output_path: kics-results/
+          output_formats: 'json,sarif'
+          ignore_on_exit: results
+          enable_annotations: 'true'
+
+      - name: Upload SARIF to GitHub code scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: kics-results/results.sarif
+
+      - name: Upload KICS results artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kics-results
+          path: kics-results/
+
+  # ---------- Vorpal: fast PR-level code scanning ----------
+  vorpal:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get changed files
+        id: changed-files
+        uses: tj-actions/changed-files@2f7c5bfce28377bc069a65ba478de0a74aa0ca32 # v46.0.1
+        with:
+          separator: ','
+
+      - name: Vorpal scan with reviewdog
+        if: steps.changed-files.outputs.all_changed_files != ''
+        uses: checkmarx/vorpal-reviewdog-github-action@v1.2.0
+        with:
+          source_path: "${{ steps.changed-files.outputs.all_changed_files }}"
+          filter_mode: file
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          reporter: github-pr-check
+          level: error
+          # set true so this job's own pass/fail status reflects whether Vorpal found anything —
+          # that status is what the summary job below reads, since Vorpal has no report file to parse
+          fail_on_error: true
+
+  # ---------- 2ms: secret detection ----------
+  secrets-scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run 2ms secret scan
+        run: |
+          mkdir -p artifacts
+          chmod 777 artifacts
+          docker run --rm --user "$(id -u):$(id -g)" -v "$PWD":/repo checkmarx/2ms:4.9.0 \
+            git /repo --stdout-format sarif \
+            --report-path /repo/artifacts/2ms.sarif \
+            --ignore-on-exit results
+          echo "---- artifacts folder after scan ----"
+          ls -la artifacts/ || echo "artifacts folder is empty or missing"
+
+      - name: Upload SARIF to GitHub code scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: artifacts/2ms.sarif
+
+      - name: Upload 2ms results artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: 2ms-results
+          path: artifacts/
+
+  # ---------- Summary: one table, all three tools, severities + pass/fail ----------
+  summary:
+    runs-on: ubuntu-latest
+    needs: [kics, vorpal, secrets-scan]
+    if: always()
+    steps:
+      - name: Download KICS results
+        uses: actions/download-artifact@v4
+        with:
+          name: kics-results
+          path: kics-results
+        continue-on-error: true
+
+      - name: Download 2ms results
+        uses: actions/download-artifact@v4
+        with:
+          name: 2ms-results
+          path: 2ms-results
+        continue-on-error: true
+
+      - name: Build combined summary
+        run: |
+          echo "# AppSec Scan Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Tool | Status | Critical | High | Medium | Low | Total |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|---|---|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
+
+          # ---- KICS row ----
+          if [ -f "kics-results/results.json" ]; then
+            KICS_CRIT=$(jq '.severity_counters.CRITICAL // 0' kics-results/results.json)
+            KICS_HIGH=$(jq '.severity_counters.HIGH // 0' kics-results/results.json)
+            KICS_MED=$(jq '.severity_counters.MEDIUM // 0' kics-results/results.json)
+            KICS_LOW=$(jq '.severity_counters.LOW // 0' kics-results/results.json)
+            KICS_TOTAL=$(jq '.total_counter // 0' kics-results/results.json)
+            KICS_STATUS="❌ Failed"
+            if [ "$KICS_TOTAL" = "0" ]; then KICS_STATUS="✅ Passed"; fi
+            echo "| KICS (IaC) | $KICS_STATUS | $KICS_CRIT | $KICS_HIGH | $KICS_MED | $KICS_LOW | $KICS_TOTAL |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| KICS (IaC) | ⚠️ No report | — | — | — | — | — |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # ---- Vorpal row (no report file — status comes from the job's own pass/fail) ----
+          VORPAL_RESULT="${{ needs.vorpal.result }}"
+          if [ "$VORPAL_RESULT" = "success" ]; then
+            echo "| Vorpal (SAST) | ✅ Passed | — | — | — | — | See PR Files tab |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| Vorpal (SAST) | ❌ Failed | — | — | — | — | See PR Files tab |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # ---- 2ms row ----
+          if [ -f "2ms-results/2ms.sarif" ]; then
+            MS_TOTAL=$(jq '[.runs[0].results[]?] | length' 2ms-results/2ms.sarif)
+            MS_STATUS="❌ Failed"
+            if [ "$MS_TOTAL" = "0" ]; then MS_STATUS="✅ Passed"; fi
+            echo "| 2MS (Secrets) | $MS_STATUS | — | $MS_TOTAL | — | — | $MS_TOTAL |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| 2MS (Secrets) | ⚠️ No report | — | — | — | — | — |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Full findings: **Security tab → Code scanning alerts** (KICS + 2MS) and **PR → Files changed** (Vorpal inline comments)." >> "$GITHUB_STEP_SUMMARY"
