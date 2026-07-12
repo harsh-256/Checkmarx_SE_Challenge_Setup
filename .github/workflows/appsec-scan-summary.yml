@@ -60,8 +60,6 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           reporter: github-pr-check
           level: error
-          # set true so this job's own pass/fail status reflects whether Vorpal found anything —
-          # that status is what the summary job below reads, since Vorpal has no report file to parse
           fail_on_error: true
 
   # ---------- 2ms: secret detection ----------
@@ -78,13 +76,10 @@ jobs:
       - name: Run 2ms secret scan
         run: |
           mkdir -p artifacts
-          chmod 777 artifacts
-          docker run --rm --user "$(id -u):$(id -g)" -v "$PWD":/repo checkmarx/2ms:4.9.0 \
+          docker run --rm -v "$PWD":/repo checkmarx/2ms:4.9.0 \
             git /repo --stdout-format sarif \
             --report-path /repo/artifacts/2ms.sarif \
             --ignore-on-exit results
-          echo "---- artifacts folder after scan ----"
-          ls -la artifacts/ || echo "artifacts folder is empty or missing"
 
       - name: Upload SARIF to GitHub code scanning
         if: always()
@@ -126,7 +121,6 @@ jobs:
           echo "| Tool | Status | Critical | High | Medium | Low | Total |" >> "$GITHUB_STEP_SUMMARY"
           echo "|---|---|---|---|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
 
-          # ---- KICS row ----
           if [ -f "kics-results/results.json" ]; then
             KICS_CRIT=$(jq '.severity_counters.CRITICAL // 0' kics-results/results.json)
             KICS_HIGH=$(jq '.severity_counters.HIGH // 0' kics-results/results.json)
@@ -140,7 +134,6 @@ jobs:
             echo "| KICS (IaC) | ⚠️ No report | — | — | — | — | — |" >> "$GITHUB_STEP_SUMMARY"
           fi
 
-          # ---- Vorpal row (no report file — status comes from the job's own pass/fail) ----
           VORPAL_RESULT="${{ needs.vorpal.result }}"
           if [ "$VORPAL_RESULT" = "success" ]; then
             echo "| Vorpal (SAST) | ✅ Passed | — | — | — | — | See PR Files tab |" >> "$GITHUB_STEP_SUMMARY"
@@ -148,7 +141,6 @@ jobs:
             echo "| Vorpal (SAST) | ❌ Failed | — | — | — | — | See PR Files tab |" >> "$GITHUB_STEP_SUMMARY"
           fi
 
-          # ---- 2ms row ----
           if [ -f "2ms-results/2ms.sarif" ]; then
             MS_TOTAL=$(jq '[.runs[0].results[]?] | length' 2ms-results/2ms.sarif)
             MS_STATUS="❌ Failed"
